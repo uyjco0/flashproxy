@@ -60,6 +60,8 @@ class options(object):
     pid_filename = None
     safe_logging = True
 
+    address_family = socket.AF_UNSPEC
+
 # We accept up to this many bytes from a socket not yet matched with a partner
 # before disconnecting it.
 UNCONNECTED_BUFFER_LIMIT = 10240
@@ -90,6 +92,8 @@ connect to you. You need to register in some way in order to get any service.
 The --facilitator option allows controlling which facilitator is used; if
 omitted, it uses a public default.
 
+  -4                        name lookups use only IPv4.
+  -6                        name lookups use only IPv6.
       --daemon              daemonize (Unix only).
       --external            be an external proxy (don't interact with Tor using
                               environment variables and stdout).
@@ -939,14 +943,24 @@ def proxy_loop():
 
 def build_register_command(method):
     # sys.path[0] is initialized to the directory containing the Python script file.
+    argument = None
+    if options.address_family == socket.AF_INET:
+        argument = '-4'
+    elif options.address_family == socket.AF_INET6:
+        argument = '-6'
     script_dir = sys.path[0]
     if not script_dir:
         # Maybe the script was read from stdin; in any case don't guess at the directory.
         raise ValueError("Can't find executable directory for registration helpers")
     if method == "email":
-        return [os.path.join(script_dir, "flashproxy-reg-email")]
+        command = [os.path.join(script_dir, "flashproxy-reg-email")]
+        if argument is not None:
+           command += [argument]
+        return command
     elif method == "http":
         command = [os.path.join(script_dir, "flashproxy-reg-http")]
+        if argument is not None:
+            command += [argument]
         if options.facilitator_url is not None:
             command += ["-f", options.facilitator_url]
         return command
@@ -1029,9 +1043,13 @@ def main():
     register_addr_spec = None
     register_methods = []
 
-    opts, args = getopt.gnu_getopt(sys.argv[1:], "f:hl:r", ["daemon", "external", "facilitator=", "help", "log=", "pidfile=", "register", "register-addr=", "register-methods=", "unsafe-logging"])
+    opts, args = getopt.gnu_getopt(sys.argv[1:], "46f:hl:r", ["daemon", "external", "facilitator=", "help", "log=", "pidfile=", "register", "register-addr=", "register-methods=", "unsafe-logging"])
     for o, a in opts:
-        if o == "--daemon":
+        if o == "-4":
+            options.address_family = socket.AF_INET
+        elif o == "-6":
+            options.address_family = socket.AF_INET6
+        elif o == "--daemon":
             options.daemonize = True
         elif o == "--external":
             options.managed = False
