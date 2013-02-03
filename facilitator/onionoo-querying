@@ -1,0 +1,340 @@
+#!/usr/bin/env python
+
+import re
+import sys
+import os
+import socket
+import SocketServer
+import threading
+import errno
+import getopt
+import time
+
+from M2Crypto import SSL, m2urllib2
+import tempfile
+from StringIO import StringIO
+import gzip
+import json
+
+import fac
+
+# To find the 'Server certificate' used by the Onionoo Server to copy here, run the following command:
+# command: openssl s_client -connect onionoo.torproject.org:443  -CApath /etc/ssl/certs
+CA_CERTS = """\
+-----BEGIN CERTIFICATE-----
+MIIDxTCCAq2gAwIBAgIQAqxcJmoLQJuPC3nyrkYldzANBgkqhkiG9w0BAQUFADBs
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSswKQYDVQQDEyJEaWdpQ2VydCBIaWdoIEFzc3VyYW5j
+ZSBFViBSb290IENBMB4XDTA2MTExMDAwMDAwMFoXDTMxMTExMDAwMDAwMFowbDEL
+MAkGA1UEBhMCVVMxFTATBgNVBAoTDERpZ2lDZXJ0IEluYzEZMBcGA1UECxMQd3d3
+LmRpZ2ljZXJ0LmNvbTErMCkGA1UEAxMiRGlnaUNlcnQgSGlnaCBBc3N1cmFuY2Ug
+RVYgUm9vdCBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMbM5XPm
++9S75S0tMqbf5YE/yc0lSbZxKsPVlDRnogocsF9ppkCxxLeyj9CYpKlBWTrT3JTW
+PNt0OKRKzE0lgvdKpVMSOO7zSW1xkX5jtqumX8OkhPhPYlG++MXs2ziS4wblCJEM
+xChBVfvLWokVfnHoNb9Ncgk9vjo4UFt3MRuNs8ckRZqnrG0AFFoEt7oT61EKmEFB
+Ik5lYYeBQVCmeVyJ3hlKV9Uu5l0cUyx+mM0aBhakaHPQNAQTXKFx01p8VdteZOE3
+hzBWBOURtCmAEvF5OYiiAhF8J2a3iLd48soKqDirCmTCv2ZdlYTBoSUeh10aUAsg
+EsxBu24LUTi4S8sCAwEAAaNjMGEwDgYDVR0PAQH/BAQDAgGGMA8GA1UdEwEB/wQF
+MAMBAf8wHQYDVR0OBBYEFLE+w2kD+L9HAdSYJhoIAu9jZCvDMB8GA1UdIwQYMBaA
+FLE+w2kD+L9HAdSYJhoIAu9jZCvDMA0GCSqGSIb3DQEBBQUAA4IBAQAcGgaX3Nec
+nzyIZgYIVyHbIUf4KmeqvxgydkAQV8GK83rZEWWONfqe/EW1ntlMMUu4kehDLI6z
+eM7b41N5cdblIZQB2lWHmiRk9opmzN6cN82oNLFpmyPInngiK3BD41VHMWEZ71jF
+hS9OMPagMRYjyOfiZRYzy78aG6A9+MpeizGLYAiJLQwGXFK3xPkKmNEVX58Svnw2
+Yzi9RKR/5CYrCsSXaQ3pjOLAEFe4yHYSkVXySGnYvCoCWw9E1CAx2/S6cCZdkGCe
+vEsXCS+0yx5DaMkHJ8HSXPfqIbloEpw8nL+e/IBcm2PN7EeqJSdnoDfzAIJ9VNep
++OkuE6N36B9K
+-----END CERTIFICATE-----
+"""
+
+SECURE_PROTOCOL = 'tlsv1'
+
+LISTEN_ADDRESS = "127.0.0.1"
+DEFAULT_LISTEN_PORT = 9003
+DEFAULT_LOG_FILENAME = "fac-onionoo.log"
+DEFAULT_ONIONOO_QUERY_URL = "https://onionoo.torproject.org/details?type=relay&running=true"
+
+ELAPSED_UPDATE_TOR_NODES_TIME = 3600
+
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+ONIONOO_REQ_HEADER1 = 'Accept-Encoding'
+ONIONOO_REQ_HEADER1_VAL = 'gzip'
+ONIONOO_REQ_HEADER2 = 'If-Modified-Since'
+ONIONOO_RES_HEADER1 = 'Content-Encoding'
+ONIONOO_RES_HEADER1_VAL = 'gzip'
+ONIONOO_RES_HEADER2 = 'Last-Modified'
+ONIONOO_FIELD1 = 'relays'
+ONIONOO_FIELD2 = 'or_addresses'
+ONIONOO_FIELD3 = 'exit_addresses'
+ONIONOO_FIELD4 = 'exit_policy'
+
+class options(object):
+    listen_port = DEFAULT_LISTEN_PORT
+    log_filename = DEFAULT_LOG_FILENAME
+    log_file = sys.stdout
+    daemonize = True
+    pid_filename = None
+    safe_logging = True
+    onionoo_spec = DEFAULT_ONIONOO_QUERY_URL
+
+    @staticmethod
+    def set_onionoo_spec(spec):
+        options.onionoo_spec = spec
+
+def safe_str(s):
+    """Return s if options.safe_logging is true, and "[scrubbed]" otherwise."""
+    if options.safe_logging:
+        return "[scrubbed]"
+    else:
+        return s
+
+log_lock = threading.Lock()
+
+def log(msg):
+    log_lock.acquire()
+    try:
+        print >>  options.log_file, (u"%s %s" % (time.strftime(LOG_DATE_FORMAT), msg)).encode("UTF-8")
+        options.log_file.flush()
+    finally:
+        log_lock.release()
+
+def usage(f = sys.stdout):
+    print >> f, """\
+Usage: %(progname)s -o ONIONOO SERVER <OPTIONS>
+Helper to the Flash proxy facilitator: Create a local database of Tor Exit nodes
+querying periodically to an ONIONOO SERVER, and checks if a Proxy querying the
+Facilitator has an IP beloning to a Tor Exit Node. Listen on 127.0.0.1 and port 
+PORT (by default %(port)d).
+
+  -d, --debug             don't daemonize, log to stdout.
+  -h, --help              show this help.
+  -l, --log FILENAME      write log to FILENAME (default \"%(log)s\").
+  -p, --port PORT         listen on PORT (by default %(port)d).
+      --pidfile FILENAME  write PID to FILENAME after daemonizing.
+  -o, --onionoo ONIONOO   the ONIONOO server (HTTPS_URL) where to query about Tor Exit nodes.
+      --unsafe-logging    don't scrub IP addresses from logs.\
+""" % {
+    "progname": sys.argv[0],
+    "port": DEFAULT_LISTEN_PORT,
+    "log": DEFAULT_LOG_FILENAME,
+}
+
+# The class to manage the local db with the latest Tor Exit nodes.
+class TorExitNodesSet(object):
+    def __init__(self):
+        self.set = dict()
+        self.cv = threading.Condition()
+
+    def replace(self, exit_nodes):
+        self.cv.acquire()
+        try:
+            self.set = exit_nodes
+            self.cv.notify()
+        finally:
+            self.cv.release()
+
+    def query(self, ip):
+        self.cv.acquire()
+        try:
+            if (not self.set) or (len(self.set) == 0) or (self.set.get(ip) is None):
+                return False
+            else:
+                return True
+        finally:
+            self.cv.release()
+
+    def __len__(self):
+        self.cv.acquire()
+        try:
+            return len(self.set)
+        finally:
+            self.cv.release()
+
+# The class to manage the timestamp with the last time that was done a query against the ONIONOOO server.
+class LastModified(object):
+    def __init__(self):
+        self.last_modified = None
+        self.cv = threading.Condition()
+
+    def update(self, last):
+        self.cv.acquire()
+        try:
+            self.last_modified = last
+            self.cv.notify()
+            return True
+        finally:
+            self.cv.release()
+
+    def get(self):
+        self.cv.acquire()
+        try:
+            return self.last_modified
+        finally:
+            self.cv.release()
+
+# It stablishes a secure connection to the Onionoo server.
+def get_connection():
+    ctx = SSL.Context(SECURE_PROTOCOL)
+    ctx.set_verify(SSL.verify_peer | SSL.verify_fail_if_no_peer_cert, depth=9)
+    ca_certs_file = tempfile.NamedTemporaryFile(prefix="fac-onionoo-", suffix=".pem", delete=True)
+    try:
+        ca_certs_file.write(CA_CERTS)
+        ca_certs_file.flush()
+        ctx.load_verify_locations(ca_certs_file.name)
+    finally:
+        ca_certs_file.close()
+    opener = m2urllib2.build_opener(ctx)
+    # Caching: Clients should make use of the "Last-Modified" header of responses and include that 
+    # timestamp in a "If-Modified-Since" header of subsequent requests.
+    # Compression: Clients should include an "Accept-Encoding: gzip" header in their requests and handle 
+    # gzip-compressed responses. See at: https://onionoo.torproject.org/
+    if last_modified.get() is not None:
+        opener.addheaders = [(ONIONOO_REQ_HEADER2, last_modified.get())]
+    opener.addheaders = [(ONIONOO_REQ_HEADER1, ONIONOO_REQ_HEADER1_VAL)]
+    m2urllib2.install_opener(opener)
+    req = m2urllib2.Request(options.onionoo_spec)
+
+    return m2urllib2.urlopen(req)
+
+# It just consider a relay an exit if its exit policy is not exactly "reject *:*". 
+# It is a simplification (it is fast but it is possible to have some false positives).
+def is_exiting_allowed(exit_policies):
+    res = True
+    if exit_policies is not None and len(exit_policies) == 1:
+        if exit_policies[0] == "reject *:*":
+            res = False
+    return res
+
+# It query the Onionoo Server and parses its response.
+def query_onionoo_server():
+    res_addresses = None
+    try:
+        response = get_connection()
+        last_modified.update(response.info().get(ONIONOO_RES_HEADER2))
+        # If the response is coming compressed, then it is descompressed.
+        if response.info().get(ONIONOO_RES_HEADER1) == ONIONOO_RES_HEADER1_VAL:
+            buf = StringIO( response.read())
+            f = gzip.GzipFile(fileobj=buf)
+            data = f.read()
+        else:
+            data = response.read()
+        json_data = json.loads(data)
+        if (json_data is not None) and (ONIONOO_FIELD1 in json_data):
+            res_addresses = dict()
+            # Looping through the relays 's details.
+            for el in json_data[ONIONOO_FIELD1]:
+                if ONIONOO_FIELD4 in el:
+                    exit_policies = []
+                    # Loading the relay 's Exit Policies.
+                    for policy in el[ONIONOO_FIELD4]:
+                        exit_policies.append(str(policy))
+                    if is_exiting_allowed(exit_policies):
+                        if ONIONOO_FIELD2 in el:
+                           for ip in el[ONIONOO_FIELD2]:
+                               res_ip = fac.parse_addr_spec(str(ip), defport=0)
+                               res_addresses[res_ip[0]] = 1
+                        if ONIONOO_FIELD3 in el:
+                           for ip in el[ONIONOO_FIELD3]:
+                               res_ip = fac.parse_addr_spec(str(ip), defport=0)
+                               res_addresses[res_ip[0]] = 1
+        return res_addresses
+    except Exception:
+        e = sys.exc_info()[1]
+        log(u"There was a problem querying the ONIONOO server: %s" %(str(e)))
+        return None
+
+# It is the main function for the thread in charge of updating the local db with the latest Tor Exit nodes.
+def update_local_db():
+    tor_nodes = None
+    while True:
+        try:
+            tor_nodes = query_onionoo_server()
+            if tor_nodes is not None:
+                tor_exit_nodes.replace(tor_nodes)
+            log(u"Finished of querying the ONIONOO server, going to sleep.")
+            time.sleep(ELAPSED_UPDATE_TOR_NODES_TIME)
+        except Exception:
+            e = sys.exc_info()[1]
+            log(u"There was a problem with the thread querying the ONIONOO server: %s , but still alive" %(str(e)))
+
+# The local db with the latest Tor Exit nodes.
+tor_exit_nodes = TorExitNodesSet()
+
+# The timestamp with the last time that was done a query against the ONIONOOO server.
+last_modified = LastModified()
+
+class Handler(SocketServer.BaseRequestHandler):
+    def handle(self):
+        res = 'OK' + '_' + str(len(tor_exit_nodes))
+        # A IPv4 address has at maximum 15 characters, and a IPv6 address has at maximum 39 characters.
+        # A buffer size of 1024 is enough.
+        self.data = self.request.recv(1024).strip()
+        if tor_exit_nodes.query(self.data):
+            res = 'EXIT'
+        self.request.sendall(res.encode("UTF-8"))
+
+class Server(SocketServer.ThreadingMixIn, SocketServer.TCPServer):
+    allow_reuse_address = True
+
+def main():
+    opts, args = getopt.gnu_getopt(sys.argv[1:], "dhl:p:o:",
+        ["debug", "help", "log=", "port=", "pidfile=", "onionoo=", "unsafe-logging"])
+    for o, a in opts:
+        if o == "-d" or o == "--debug":
+            options.daemonize = False
+            options.log_filename = None
+        elif o == "-h" or o == "--help":
+            usage()
+            sys.exit()
+        elif o == "-l" or o == "--log":
+            options.log_filename = a
+        elif o == "-p" or o == "--port":
+            options.listen_port = int(a)
+        elif o == "--pidfile":
+            options.pid_filename = a
+        elif o == "-o" or o == "--onionoo":
+            options.set_onionoo_spec(a)
+        elif o == "--unsafe-logging":
+            options.safe_logging = False
+
+    if not options.onionoo_spec:
+        print >> sys.stderr, """\
+The -o option is required. It is used to query about the Tor Exit Nodes.
+  -o HTTPS_URL\
+    """
+        sys.exit(1)
+
+    if options.log_filename:
+        options.log_file = open(options.log_filename, "a")
+        sys.stderr = options.log_file
+    else:
+        options.log_file = sys.stdout
+
+    addrinfo = socket.getaddrinfo(LISTEN_ADDRESS, options.listen_port, 0, socket.SOCK_STREAM, socket.IPPROTO_TCP)[0]
+
+    server = Server(addrinfo[4], Handler)
+
+    log(u"start on %s" % fac.format_addr(addrinfo[4]))
+    log(u"using onionoo address %s" % options.onionoo_spec)
+
+    if options.daemonize:
+        log(u"daemonizing")
+        pid = os.fork()
+        if pid != 0:
+            if options.pid_filename:
+                f = open(options.pid_filename, "w")
+                print >> f, pid
+                f.close()
+            sys.exit(0)
+
+    thread = threading.Thread(target = update_local_db)
+    thread.daemon = True
+    thread.start()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
